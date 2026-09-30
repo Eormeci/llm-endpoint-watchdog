@@ -8,10 +8,12 @@ and serves a real-time web dashboard.
 import http.server
 import json
 import socket
+import subprocess
 import threading
 import time
 import urllib.request
 import urllib.error
+import uuid
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import Optional
@@ -32,6 +34,14 @@ CODEX_INSTALLATION_ID_FILE = os.path.expanduser("~/.codex/installation_id")
 CLAUDE_CRED_FILE = os.path.expanduser("~/.claude/.credentials.json")
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/codex/usage"
 CLAUDE_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+
+# --- GPU Monitor Config ---
+GPU_CHECK_INTERVAL = 60  # seconds between ssh nvidia-smi polls
+GPU_SSH_TIMEOUT = 20  # seconds per ssh command
+DEFAULT_GPU_HOSTS = [{
+    "name": "GPU-NODE",
+    "cmd": "ssh jump-host \"ssh gpu-node 'nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits'\""
+}]
 
 # --- Favicon (SVG -> base64) ---
 FAVICON_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
@@ -88,13 +98,49 @@ def load_endpoints():
         pass
     return list(DEFAULT_ENDPOINTS)
 
-def save_endpoints(endpoints):
-    """Persist endpoint list to state file."""
+def load_gpu_hosts():
+    """Load GPU host list from state file, fallback to DEFAULT_GPU_HOSTS.
+    Each record is normalized to {id, name, cmd}; records with empty cmd are dropped.
+    """
     try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump({"endpoints": endpoints}, f, indent=2)
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, 'r') as f:
+                data = json.load(f)
+                raw = data.get("gpu_hosts", DEFAULT_GPU_HOSTS)
+                normalized = []
+                seen = set()
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    hid = item.get("id") or uuid.uuid4().hex[:8]
+                    nm = (item.get("name") or "").strip()
+                    cmd = (item.get("cmd") or "").strip()
+                    if not cmd or hid in seen:
+                        continue
+                    if not nm:
+                        nm = "GPU-" + hid[:4]
+                    seen.add(hid)
+                    normalized.append({"id": hid, "name": nm, "cmd": cmd})
+                return normalized
     except Exception:
         pass
+    return [{**item, "id": uuid.uuid4().hex[:8]} for item in DEFAULT_GPU_HOSTS]
+
+def _save_state():
+    """Persist endpoints and GPU hosts to state file."""
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump({"endpoints": ENDPOINTS, "gpu_hosts": GPU_HOSTS}, f, indent=2)
+    except Exception:
+        pass
+
+def save_endpoints(endpoints):
+    """Persist endpoint list to state file."""
+    _save_state()
+
+def save_gpu_hosts():
+    """Persist GPU host list to state file."""
+    _save_state()
 
 def parse_endpoint(ep: str):
     """Parse 'host:port' string, return (host, port)."""
@@ -104,6 +150,15 @@ def parse_endpoint(ep: str):
     return ep, 80
 
 ENDPOINTS = load_endpoints()
+GPU_HOSTS = load_gpu_hosts()
+gpu_status = {"last_check": None}
+for _item in GPU_HOSTS:
+    gpu_status[_item["id"]] = {
+        "id": _item["id"], "name": _item["name"], "cmd": _item["cmd"],
+        "online": False, "error": None, "last_check": None,
+        "gpus": [], "idle_count": 0, "total": 0,
+    }
+gpu_lock = threading.Lock()
 statuses = {}
 for item in ENDPOINTS:
     ep = item["endpoint"]
@@ -350,6 +405,93 @@ def fetch_claude_usage():
             token_status["claude"].update({"online": False, "error": str(e)[:100], "last_check": datetime.now().strftime("%H:%M:%S")})
 
 
+def fetch_gpu_status(item):
+    """SSH ile uzak makinede nvidia-smi çalıştırıp GPU durumunu parse eder."""
+    try:
+        proc = subprocess.run(item["cmd"], shell=True, capture_output=True, text=True,
+                              timeout=GPU_SSH_TIMEOUT, stdin=subprocess.DEVNULL)
+        if proc.returncode != 0:
+            err = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "SSH hatasi"
+            with gpu_lock:
+                gpu_status[item["id"]].update({
+                    "online": False, "error": err,
+                    "last_check": datetime.now().strftime("%H:%M:%S"),
+                    "gpus": [], "idle_count": 0, "total": 0,
+                })
+            return
+        out = proc.stdout.strip()
+        if not out:
+            with gpu_lock:
+                gpu_status[item["id"]].update({
+                    "online": False, "error": "nvidia-smi bos dondu",
+                    "last_check": datetime.now().strftime("%H:%M:%S"),
+                    "gpus": [], "idle_count": 0, "total": 0,
+                })
+            return
+        gpus = []
+        invalid = False
+        for raw in out.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 5:
+                invalid = True
+                continue
+            try:
+                index = int(parts[0])
+            except ValueError:
+                invalid = True
+                continue
+            try:
+                mem_used_mb = int(parts[2])
+            except ValueError:
+                mem_used_mb = None
+            try:
+                mem_total_mb = int(parts[3])
+            except ValueError:
+                mem_total_mb = None
+            try:
+                util_pct = int(parts[4])
+            except ValueError:
+                util_pct = None
+            gpus.append({
+                "index": index, "name": parts[1], "mem_used_mb": mem_used_mb,
+                "mem_total_mb": mem_total_mb, "util_pct": util_pct,
+                "idle": (util_pct == 0),
+            })
+        if invalid:
+            with gpu_lock:
+                gpu_status[item["id"]].update({
+                    "online": False, "error": "Gecersiz nvidia-smi ciktisi",
+                    "last_check": datetime.now().strftime("%H:%M:%S"),
+                    "gpus": [], "idle_count": 0, "total": 0,
+                })
+            return
+        idle_count = sum(1 for g in gpus if g["idle"])
+        total = len(gpus)
+        with gpu_lock:
+            gpu_status[item["id"]].update({
+                "online": True, "error": None,
+                "last_check": datetime.now().strftime("%H:%M:%S"),
+                "gpus": gpus, "idle_count": idle_count, "total": total,
+            })
+    except subprocess.TimeoutExpired:
+        with gpu_lock:
+            gpu_status[item["id"]].update({
+                "online": False, "error": f"Zaman asimi ({GPU_SSH_TIMEOUT}s)",
+                "last_check": datetime.now().strftime("%H:%M:%S"),
+                "gpus": [], "idle_count": 0, "total": 0,
+            })
+    except Exception as e:
+        with gpu_lock:
+            gpu_status[item["id"]].update({
+                "online": False, "error": str(e),
+                "last_check": datetime.now().strftime("%H:%M:%S"),
+                "gpus": [], "idle_count": 0, "total": 0,
+            })
+
+
 def token_loop():
     """Background thread that periodically refreshes paid-agent token usage."""
     while True:
@@ -360,6 +502,19 @@ def token_loop():
         with token_lock:
             token_status["last_check"] = datetime.now().strftime("%H:%M:%S")
         time.sleep(TOKEN_CHECK_INTERVAL)
+
+
+def gpu_loop():
+    """Background thread that periodically polls GPU status over SSH."""
+    while True:
+        threads = [threading.Thread(target=fetch_gpu_status, args=(item,)) for item in list(GPU_HOSTS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=GPU_SSH_TIMEOUT + 5)
+        with gpu_lock:
+            gpu_status["last_check"] = datetime.now().strftime("%H:%M:%S")
+        time.sleep(GPU_CHECK_INTERVAL)
 
 
 # --- Dashboard HTML ---
@@ -1431,6 +1586,11 @@ def main():
     print("   Running initial token usage fetch (Claude + Codex)...")
     token_thread = threading.Thread(target=token_loop, daemon=True)
     token_thread.start()
+
+    # Start GPU monitor thread
+    print(f"   GPU monitoru: {len(GPU_HOSTS)} makine, {GPU_CHECK_INTERVAL}s aralık")
+    gpu_thread = threading.Thread(target=gpu_loop, daemon=True)
+    gpu_thread.start()
 
     # Initial check
     print("   Running initial check...")
