@@ -1404,6 +1404,12 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             with token_lock:
                 data = json.loads(json.dumps(token_status))  # deep copy
             self._json_response(200, data)
+        elif self.path == '/api/gpu-status':
+            with gpu_lock:
+                data = json.loads(json.dumps(gpu_status))  # deep copy
+            self._json_response(200, data)
+        elif self.path == '/api/gpu-hosts':
+            self._json_response(200, {"gpu_hosts": GPU_HOSTS})
         elif self.path == '/api/endpoints':
             self._json_response(200, {"endpoints": ENDPOINTS})
         elif self.path == '/favicon.svg':
@@ -1458,6 +1464,38 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 self._json_response(200, {"ok": True, "endpoints": ENDPOINTS})
             except (json.JSONDecodeError, ValueError, TypeError) as e:
                 self._json_response(400, {"ok": False, "error": str(e)})
+        elif self.path == '/api/gpu-hosts':
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len).decode()
+            try:
+                data = json.loads(body) if body else {}
+                name = str(data.get('name', '')).strip()
+                cmd = str(data.get('cmd', '')).strip()
+                if not cmd:
+                    self._json_response(400, {"ok": False, "error": "SSH komutu gerekli"})
+                    return
+                if not name:
+                    self._json_response(400, {"ok": False, "error": "Isim gerekli"})
+                    return
+                if any(h["cmd"] == cmd for h in GPU_HOSTS):
+                    shown = cmd[:40] + "..." if len(cmd) > 40 else cmd
+                    self._json_response(409, {"ok": False, "error": f"{shown} zaten izleniyor"})
+                    return
+                new_id = uuid.uuid4().hex[:8]
+                item = {"id": new_id, "name": name, "cmd": cmd}
+                GPU_HOSTS.append(item)
+                with gpu_lock:
+                    gpu_status[new_id] = {
+                        "id": new_id, "name": name, "cmd": cmd,
+                        "online": False, "error": None, "last_check": None,
+                        "gpus": [], "idle_count": 0, "total": 0,
+                    }
+                save_gpu_hosts()
+                threading.Thread(target=fetch_gpu_status, args=(item,), daemon=True).start()
+                print(f"   + GPU makinesi {name} eklendi (toplam: {len(GPU_HOSTS)})")
+                self._json_response(200, {"ok": True, "gpu_hosts": GPU_HOSTS})
+            except (json.JSONDecodeError, ValueError, TypeError) as e:
+                self._json_response(400, {"ok": False, "error": str(e)})
         else:
             self.send_response(404)
             self.end_headers()
@@ -1478,6 +1516,26 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 save_endpoints(ENDPOINTS)
                 print(f"   - Endpoint {ep} kaldirildi (toplam: {len(ENDPOINTS)})")
                 self._json_response(200, {"ok": True, "endpoints": ENDPOINTS})
+            except (json.JSONDecodeError, ValueError, TypeError) as e:
+                self._json_response(400, {"ok": False, "error": str(e)})
+        elif self.path == '/api/gpu-hosts':
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len).decode()
+            try:
+                data = json.loads(body) if body else {}
+                h_id = str(data.get('id', '')).strip()
+                if not h_id:
+                    self._json_response(400, {"ok": False, "error": "GPU makinesi kimligi gerekli"})
+                    return
+                if not any(h["id"] == h_id for h in GPU_HOSTS):
+                    self._json_response(404, {"ok": False, "error": f"{h_id} bulunamadi"})
+                    return
+                GPU_HOSTS[:] = [h for h in GPU_HOSTS if h["id"] != h_id]
+                with gpu_lock:
+                    gpu_status.pop(h_id, None)
+                save_gpu_hosts()
+                print(f"   - GPU makinesi {h_id} kaldirildi (toplam: {len(GPU_HOSTS)})")
+                self._json_response(200, {"ok": True, "gpu_hosts": GPU_HOSTS})
             except (json.JSONDecodeError, ValueError, TypeError) as e:
                 self._json_response(400, {"ok": False, "error": str(e)})
         else:
@@ -1526,6 +1584,45 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 save_endpoints(ENDPOINTS)
                 print(f"   ✎ Endpoint güncellendi: {old_ep} -> {new_ep} ({name or 'isimsiz'})")
                 self._json_response(200, {"ok": True, "endpoints": ENDPOINTS})
+            except (json.JSONDecodeError, ValueError, TypeError) as e:
+                self._json_response(400, {"ok": False, "error": str(e)})
+        elif self.path == '/api/gpu-hosts':
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len).decode()
+            try:
+                data = json.loads(body) if body else {}
+                h_id = str(data.get('id', '')).strip()
+                name = str(data.get('name', '')).strip()
+                cmd = str(data.get('cmd', '')).strip()
+                if not h_id:
+                    self._json_response(400, {"ok": False, "error": "GPU makinesi kimligi gerekli"})
+                    return
+                if not cmd:
+                    self._json_response(400, {"ok": False, "error": "SSH komutu gerekli"})
+                    return
+                if not name:
+                    self._json_response(400, {"ok": False, "error": "Isim gerekli"})
+                    return
+                idx = next((i for i, h in enumerate(GPU_HOSTS) if h["id"] == h_id), -1)
+                if idx == -1:
+                    self._json_response(404, {"ok": False, "error": f"{h_id} bulunamadi"})
+                    return
+                if any(h["cmd"] == cmd and h["id"] != h_id for h in GPU_HOSTS):
+                    shown = cmd[:40] + "..." if len(cmd) > 40 else cmd
+                    self._json_response(409, {"ok": False, "error": f"{shown} zaten izleniyor"})
+                    return
+                item = {"id": h_id, "name": name, "cmd": cmd}
+                GPU_HOSTS[idx] = item
+                with gpu_lock:
+                    gpu_status[h_id] = {
+                        "id": h_id, "name": name, "cmd": cmd,
+                        "online": False, "error": None, "last_check": None,
+                        "gpus": [], "idle_count": 0, "total": 0,
+                    }
+                save_gpu_hosts()
+                threading.Thread(target=fetch_gpu_status, args=(item,), daemon=True).start()
+                print(f"   ✎ GPU makinesi guncellendi: {name}")
+                self._json_response(200, {"ok": True, "gpu_hosts": GPU_HOSTS})
             except (json.JSONDecodeError, ValueError, TypeError) as e:
                 self._json_response(400, {"ok": False, "error": str(e)})
         else:
