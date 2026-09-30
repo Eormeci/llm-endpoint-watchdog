@@ -126,21 +126,21 @@ def load_gpu_hosts():
         pass
     return [{**item, "id": uuid.uuid4().hex[:8]} for item in DEFAULT_GPU_HOSTS]
 
-def _save_state():
+def _save_state(endpoints):
     """Persist endpoints and GPU hosts to state file."""
     try:
         with open(STATE_FILE, 'w') as f:
-            json.dump({"endpoints": ENDPOINTS, "gpu_hosts": GPU_HOSTS}, f, indent=2)
+            json.dump({"endpoints": endpoints, "gpu_hosts": GPU_HOSTS}, f, indent=2)
     except Exception:
         pass
 
 def save_endpoints(endpoints):
     """Persist endpoint list to state file."""
-    _save_state()
+    _save_state(endpoints)
 
 def save_gpu_hosts():
     """Persist GPU host list to state file."""
-    _save_state()
+    _save_state(ENDPOINTS)
 
 def parse_endpoint(ep: str):
     """Parse 'host:port' string, return (host, port)."""
@@ -407,13 +407,20 @@ def fetch_claude_usage():
 
 def fetch_gpu_status(item):
     """SSH ile uzak makinede nvidia-smi çalıştırıp GPU durumunu parse eder."""
+    def _slot():
+        return gpu_status.setdefault(item["id"], {
+            "id": item["id"], "name": item.get("name", ""), "cmd": item.get("cmd", ""),
+            "online": False, "error": None, "last_check": None,
+            "gpus": [], "idle_count": 0, "total": 0,
+        })
+
     try:
         proc = subprocess.run(item["cmd"], shell=True, capture_output=True, text=True,
                               timeout=GPU_SSH_TIMEOUT, stdin=subprocess.DEVNULL)
         if proc.returncode != 0:
             err = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "SSH hatasi"
             with gpu_lock:
-                gpu_status[item["id"]].update({
+                _slot().update({
                     "online": False, "error": err,
                     "last_check": datetime.now().strftime("%H:%M:%S"),
                     "gpus": [], "idle_count": 0, "total": 0,
@@ -422,7 +429,7 @@ def fetch_gpu_status(item):
         out = proc.stdout.strip()
         if not out:
             with gpu_lock:
-                gpu_status[item["id"]].update({
+                _slot().update({
                     "online": False, "error": "nvidia-smi bos dondu",
                     "last_check": datetime.now().strftime("%H:%M:%S"),
                     "gpus": [], "idle_count": 0, "total": 0,
@@ -462,7 +469,7 @@ def fetch_gpu_status(item):
             })
         if invalid:
             with gpu_lock:
-                gpu_status[item["id"]].update({
+                _slot().update({
                     "online": False, "error": "Gecersiz nvidia-smi ciktisi",
                     "last_check": datetime.now().strftime("%H:%M:%S"),
                     "gpus": [], "idle_count": 0, "total": 0,
@@ -471,21 +478,21 @@ def fetch_gpu_status(item):
         idle_count = sum(1 for g in gpus if g["idle"])
         total = len(gpus)
         with gpu_lock:
-            gpu_status[item["id"]].update({
+            _slot().update({
                 "online": True, "error": None,
                 "last_check": datetime.now().strftime("%H:%M:%S"),
                 "gpus": gpus, "idle_count": idle_count, "total": total,
             })
     except subprocess.TimeoutExpired:
         with gpu_lock:
-            gpu_status[item["id"]].update({
+            _slot().update({
                 "online": False, "error": f"Zaman asimi ({GPU_SSH_TIMEOUT}s)",
                 "last_check": datetime.now().strftime("%H:%M:%S"),
                 "gpus": [], "idle_count": 0, "total": 0,
             })
     except Exception as e:
         with gpu_lock:
-            gpu_status[item["id"]].update({
+            _slot().update({
                 "online": False, "error": str(e),
                 "last_check": datetime.now().strftime("%H:%M:%S"),
                 "gpus": [], "idle_count": 0, "total": 0,
