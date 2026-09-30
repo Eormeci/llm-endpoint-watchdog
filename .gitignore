@@ -10,3 +10,4 @@ watchdog_endpoints.json
 .idea/
 .vscode/
 .DS_Store
+.worktrees/
