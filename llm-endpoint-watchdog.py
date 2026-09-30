@@ -407,33 +407,30 @@ def fetch_claude_usage():
 
 def fetch_gpu_status(item):
     """SSH ile uzak makinede nvidia-smi çalıştırıp GPU durumunu parse eder."""
-    def _slot():
-        return gpu_status.setdefault(item["id"], {
-            "id": item["id"], "name": item.get("name", ""), "cmd": item.get("cmd", ""),
-            "online": False, "error": None, "last_check": None,
-            "gpus": [], "idle_count": 0, "total": 0,
-        })
+    def _put(**fields):
+        with gpu_lock:
+            if not any(h.get("id") == item["id"] for h in GPU_HOSTS):
+                return
+            gpu_status.setdefault(item["id"], {
+                "id": item["id"], "name": item.get("name", ""), "cmd": item.get("cmd", ""),
+                "online": False, "error": None, "last_check": None,
+                "gpus": [], "idle_count": 0, "total": 0,
+            }).update(fields)
+
+    def _fail(error):
+        _put(online=False, error=error,
+             last_check=datetime.now().strftime("%H:%M:%S"),
+             gpus=[], idle_count=0, total=0)
 
     try:
         proc = subprocess.run(item["cmd"], shell=True, capture_output=True, text=True,
                               timeout=GPU_SSH_TIMEOUT, stdin=subprocess.DEVNULL)
         if proc.returncode != 0:
-            err = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "SSH hatasi"
-            with gpu_lock:
-                _slot().update({
-                    "online": False, "error": err,
-                    "last_check": datetime.now().strftime("%H:%M:%S"),
-                    "gpus": [], "idle_count": 0, "total": 0,
-                })
+            _fail(proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "SSH hatasi")
             return
         out = proc.stdout.strip()
         if not out:
-            with gpu_lock:
-                _slot().update({
-                    "online": False, "error": "nvidia-smi bos dondu",
-                    "last_check": datetime.now().strftime("%H:%M:%S"),
-                    "gpus": [], "idle_count": 0, "total": 0,
-                })
+            _fail("nvidia-smi bos dondu")
             return
         gpus = []
         invalid = False
@@ -468,35 +465,17 @@ def fetch_gpu_status(item):
                 "idle": (util_pct == 0),
             })
         if invalid:
-            with gpu_lock:
-                _slot().update({
-                    "online": False, "error": "Gecersiz nvidia-smi ciktisi",
-                    "last_check": datetime.now().strftime("%H:%M:%S"),
-                    "gpus": [], "idle_count": 0, "total": 0,
-                })
+            _fail("Gecersiz nvidia-smi ciktisi")
             return
         idle_count = sum(1 for g in gpus if g["idle"])
         total = len(gpus)
-        with gpu_lock:
-            _slot().update({
-                "online": True, "error": None,
-                "last_check": datetime.now().strftime("%H:%M:%S"),
-                "gpus": gpus, "idle_count": idle_count, "total": total,
-            })
+        _put(online=True, error=None,
+             last_check=datetime.now().strftime("%H:%M:%S"),
+             gpus=gpus, idle_count=idle_count, total=total)
     except subprocess.TimeoutExpired:
-        with gpu_lock:
-            _slot().update({
-                "online": False, "error": f"Zaman asimi ({GPU_SSH_TIMEOUT}s)",
-                "last_check": datetime.now().strftime("%H:%M:%S"),
-                "gpus": [], "idle_count": 0, "total": 0,
-            })
+        _fail(f"Zaman asimi ({GPU_SSH_TIMEOUT}s)")
     except Exception as e:
-        with gpu_lock:
-            _slot().update({
-                "online": False, "error": str(e),
-                "last_check": datetime.now().strftime("%H:%M:%S"),
-                "gpus": [], "idle_count": 0, "total": 0,
-            })
+        _fail(str(e))
 
 
 def token_loop():
@@ -810,6 +789,221 @@ body {
     border-radius: 8px;
     border: 1px solid #f59f0033;
 }
+/* GPU idle monitor */
+.gpu-section {
+    max-width: 1600px;
+    margin: 0 auto 28px auto;
+}
+.gpu-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+}
+.gpu-toolbar .gpu-heading {
+    font-size: 1em;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: #777;
+    font-weight: 700;
+}
+.gpu-add-btn {
+    background: #1a1a2e;
+    color: #7c6cf0;
+    border: 1px solid #7c6cf055;
+    border-radius: 10px;
+    padding: 8px 16px;
+    font-family: inherit;
+    font-size: 0.92em;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+.gpu-add-btn:hover {
+    background: #7c6cf022;
+    border-color: #7c6cf0;
+    box-shadow: 0 4px 16px #7c6cf033;
+}
+.gpu-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+    gap: 24px;
+}
+.gpu-card {
+    background: #12121a;
+    border: 1px solid #222;
+    border-radius: 14px;
+    padding: 22px 24px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.3s, box-shadow 0.2s;
+}
+.gpu-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 4px;
+    background: #7c6cf0;
+}
+.gpu-card.offline { border-color: #e0313144; }
+.gpu-card.offline::before { background: #e03131; }
+.gpu-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+.gpu-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 1.3em;
+    font-weight: 700;
+    min-width: 0;
+}
+.gpu-brand .dot {
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    flex: none;
+    background: #7c6cf0;
+    box-shadow: 0 0 10px #7c6cf088;
+}
+.gpu-card.offline .gpu-brand .dot {
+    background: #e03131;
+    box-shadow: 0 0 10px #e0313188;
+}
+.gpu-badge {
+    font-size: 0.78em;
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+}
+.gpu-badge.ok { background: #10a37f22; color: #10a37f; border: 1px solid #10a37f55; }
+.gpu-badge.warn { background: #e0313122; color: #e03131; border: 1px solid #e0313155; }
+.gpu-badge.off { background: #4443; color: #888; border: 1px solid #4445; }
+.gpu-count {
+    font-size: 1.25em;
+    font-weight: 800;
+    letter-spacing: 1px;
+    margin-bottom: 12px;
+}
+.gpu-count.good { color: #10a37f; }
+.gpu-count.bad { color: #e03131; }
+.gpu-count small {
+    display: block;
+    font-size: 0.52em;
+    font-weight: 400;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: #666;
+    margin-top: 2px;
+}
+.gpu-bar {
+    height: 10px;
+    background: #1a1a2e;
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 14px;
+}
+.gpu-bar .fill {
+    height: 100%;
+    border-radius: 6px;
+    transition: width 0.6s ease;
+}
+.gpu-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.gpu-row {
+    display: grid;
+    grid-template-columns: 52px 1fr 88px 62px;
+    align-items: center;
+    gap: 10px;
+    padding: 5px 8px;
+    border-radius: 6px;
+    font-size: 0.82em;
+}
+.gpu-row.idle { background: #10a37f14; }
+.gpu-row.busy { background: #e031310f; }
+.gpu-row .idx {
+    color: #888;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+.gpu-row .mini-bar {
+    height: 6px;
+    background: #1a1a2e;
+    border-radius: 4px;
+    overflow: hidden;
+}
+.gpu-row .mini-bar .fill {
+    height: 100%;
+    border-radius: 4px;
+}
+.gpu-row .gval {
+    color: #cfcfcf;
+    text-align: right;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+}
+.gpu-row .tag {
+    text-align: right;
+    font-size: 0.92em;
+    white-space: nowrap;
+}
+.gpu-row .tag.idle { color: #10a37f; }
+.gpu-row .tag.busy { color: #e03131; }
+.gpu-empty {
+    color: #666;
+    padding: 18px 8px;
+    font-size: 0.92em;
+}
+.gpu-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid #1f1f2e;
+    font-size: 0.82em;
+    color: #777;
+}
+.gpu-actions {
+    display: flex;
+    gap: 8px;
+}
+.gpu-actions button {
+    background: #1a1a2e;
+    border: 1px solid #2a2a3e;
+    color: #aaa;
+    border-radius: 7px;
+    width: 30px;
+    height: 30px;
+    line-height: 1;
+    font-size: 0.95em;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+.gpu-actions button:hover {
+    color: #e6e6e6;
+    border-color: #7c6cf0;
+    background: #7c6cf022;
+}
+.gpu-error {
+    color: #f59f00;
+    font-size: 0.85em;
+    margin-top: 10px;
+    padding: 8px 12px;
+    background: #1a1a0a;
+    border-radius: 8px;
+    border: 1px solid #f59f0033;
+}
 /* Add Port Button */
 .header-row {
     display: flex;
@@ -881,7 +1075,8 @@ body {
     margin-bottom: 22px;
     font-size: 1.5em;
 }
-.add-port-modal input {
+.add-port-modal input,
+.add-port-modal textarea {
     background: #0a0a0f;
     border: 1px solid #333;
     color: #e0e0e0;
@@ -894,12 +1089,22 @@ body {
     text-align: center;
     letter-spacing: 1px;
 }
-.add-port-modal input:focus {
+.add-port-modal textarea {
+    text-align: left;
+    letter-spacing: 0.2px;
+    font-size: 0.92em;
+    line-height: 1.45;
+    resize: vertical;
+    min-height: 84px;
+}
+.add-port-modal input:focus,
+.add-port-modal textarea:focus {
     outline: none;
     border-color: #76b900;
     box-shadow: 0 0 0 3px #76b90022;
 }
 .add-port-modal input::placeholder { color: #555; }
+.add-port-modal textarea::placeholder { color: #555; }
 .add-port-modal .modal-btns {
     display: flex;
     gap: 12px;
@@ -1010,11 +1215,24 @@ body {
         <div class="modal-error" id="modalError"></div>
     </div>
 </div>
+<div class="add-port-modal" id="addGpuModal">
+    <div class="modal-box">
+        <h3 id="gpuModalTitle">Yeni GPU Makinesi Ekle</h3>
+        <input type="text" id="gpuNameInput" placeholder="Isim (orn: GPU-NODE)" />
+        <textarea id="gpuCmdInput" rows="3" placeholder='ssh jump-host "ssh gpu-node &apos;nvidia-smi &hellip;&apos;"'></textarea>
+        <div class="modal-btns">
+            <button class="btn-ok" id="gpuModalOkBtn" onclick="submitGpuModal()">Ekle</button>
+            <button class="btn-cancel" onclick="closeGpuModal()">Iptal</button>
+        </div>
+        <div class="modal-error" id="gpuModalError"></div>
+    </div>
+</div>
 <div class="header-row">
     <h1>⚡ LLM ENDPOINT WATCHDOG</h1>
     <div class="subtitle">__INTERVAL__s interval · since __START__</div>
 </div>
 <div class="summary" id="summary"></div>
+<div class="gpu-section" id="gpuSection"></div>
 <div class="token-section" id="tokenSection"></div>
 <div class="grid" id="grid"></div>
 <div class="footer">LLM Endpoint Watchdog v1.0 · Dashboard port __DPORT__ · Auto-refresh 5s</div>
@@ -1022,11 +1240,14 @@ body {
 const ENDPOINTS = __ENDPOINTS__;
 let refreshTimer = null;
 let tokenRefreshTimer = null;
+let gpuRefreshTimer = null;
 let isDragging = false;
 let draggedEp = null;
 let dropHandled = false;
 let lastStatusData = {};
 let editingEp = null;
+let GPU_HOSTS = [];
+let editingGpuId = null;
 
 function openModal(epToEdit) {
     const modal = document.getElementById('addModal');
@@ -1061,6 +1282,11 @@ function closeModal() {
 }
 function escapeAttr(s) {
     return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;');
+}
+function escapeHtml(v) {
+    return String(v == null ? '' : v)
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+        .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 async function submitModal() {
     const epInput = document.getElementById('newEndpointInput');
@@ -1284,11 +1510,181 @@ async function refreshTokens() {
     } catch(e) { console.error('Token fetch error:', e); }
 }
 
+function renderGpus(g) {
+    const sec = document.getElementById('gpuSection');
+    if (!sec) return;
+    const hosts = GPU_HOSTS;
+    const toolbar = `
+        <div class="gpu-toolbar">
+            <div class="gpu-heading">GPU Durumu</div>
+            <button class="gpu-add-btn" onclick="openGpuModal()">+ GPU Makinesi Ekle</button>
+        </div>`;
+    if (!hosts.length) {
+        sec.innerHTML = toolbar + `<div class="gpu-empty">Henuz GPU makinesi eklenmemis.</div>`;
+        return;
+    }
+    const cards = hosts.map(h => {
+        const s = (g && g[h.id]) || {};
+        const online = !!s.online;
+        const gpus = Array.isArray(s.gpus) ? s.gpus : [];
+        const idleCount = typeof s.idle_count === 'number' ? s.idle_count : 0;
+        const total = typeof s.total === 'number' ? s.total : gpus.length;
+        const badge = !online ? 'off' : (idleCount > 0 ? 'ok' : 'warn');
+        const badgeTxt = !online ? 'Offline' : (idleCount > 0 ? `${idleCount} GPU bos` : 'Tam Dolu');
+        const countCls = !online ? 'bad' : (idleCount > 0 ? 'good' : 'bad');
+        const busyPct = total > 0 ? Math.min(100, Math.round(100 * (total - idleCount) / total)) : 0;
+        const fillCls = !online ? 'bad' : (busyPct >= 90 ? 'bad' : (busyPct >= 70 ? 'mid' : 'good'));
+
+        let rows;
+        if (!online && !gpus.length) {
+            rows = `<div class="gpu-empty">Sorgulanamadi</div>`;
+        } else {
+            rows = `<div class="gpu-rows">` + gpus.map(gp => {
+                const isIdle = !!gp.idle;
+                const rowCls = isIdle ? 'idle' : 'busy';
+                const tagCls = isIdle ? 'idle' : 'busy';
+                const tagTxt = isIdle ? 'bosta' : 'dolu';
+                const mu = gp.mem_used_mb, mt = gp.mem_total_mb;
+                const memPct = (mt != null && mt > 0 && mu != null) ? Math.min(100, Math.round(100 * mu / mt)) : null;
+                const memFill = memPct == null ? '' : `<div class="fill ${isIdle ? 'good' : 'bad'}" style="width:${memPct}%"></div>`;
+                const memTxt = (mu == null || mt == null) ? '—' : `${Math.round(mu/102.4)/10}/${Math.round(mt/102.4)/10} GB`;
+                const utilTxt = gp.util_pct == null ? '%—' : `%${gp.util_pct}`;
+                return `<div class="gpu-row ${rowCls}">
+                    <div class="idx">GPU ${gp.index == null ? '?' : gp.index}</div>
+                    <div class="mini-bar">${memFill}</div>
+                    <div class="gval">${memTxt} &middot; ${utilTxt}</div>
+                    <div class="tag ${tagCls}">${tagTxt}</div>
+                </div>`;
+            }).join('') + `</div>`;
+        }
+
+        return `<div class="gpu-card${online ? '' : ' offline'}">
+            <div class="gpu-head">
+                <div class="gpu-brand"><span class="dot"></span>${escapeHtml(h.name || h.id)}</div>
+                <span class="gpu-badge ${badge}">${badgeTxt}</span>
+            </div>
+            <div class="gpu-count ${countCls}">${idleCount}/${total}<small>GPU BOS</small></div>
+            <div class="gpu-bar"><div class="fill ${fillCls}" style="width:${busyPct}%"></div></div>
+            ${rows}
+            ${s.error ? `<div class="gpu-error">⚠ ${escapeHtml(s.error)}</div>` : ''}
+            <div class="gpu-meta">
+                <span><b>Last:</b> ${escapeHtml(s.last_check || '—')}</span>
+                <div class="gpu-actions">
+                    <button onclick="openGpuModal('${h.id}')" title="Duzenle">&#9998;</button>
+                    <button onclick="removeGpuHost('${h.id}')" title="Kaldir">&#10005;</button>
+                </div>
+            </div>
+        </div>`;
+    }).join('');
+
+    sec.innerHTML = toolbar + `<div class="gpu-grid">${cards}</div>`;
+}
+
+async function refreshGpus() {
+    if (isDragging) return;
+    try {
+        const hr = await fetch('/api/gpu-hosts');
+        const hd = await hr.json();
+        if (hd && Array.isArray(hd.gpu_hosts)) GPU_HOSTS = hd.gpu_hosts;
+        const resp = await fetch('/api/gpu-status');
+        renderGpus(await resp.json());
+    } catch(e) { console.error('GPU fetch error:', e); }
+}
+
+async function removeGpuHost(id) {
+    if (!id) return;
+    const target = GPU_HOSTS.find(h => h.id === id);
+    if (!confirm(`${(target && target.name) || id} GPU makinesini listeden cikarmak istediginize emin misiniz?`)) return;
+    try {
+        const resp = await fetch('/api/gpu-hosts', {
+            method: 'DELETE',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({id})
+        });
+        const data = await resp.json();
+        if (data.ok) {
+            GPU_HOSTS = data.gpu_hosts || [];
+            await refreshGpus();
+        } else {
+            alert(data.error || 'Silinemedi');
+        }
+    } catch(e) {
+        console.error('Remove GPU host error:', e);
+        alert('Sunucu hatasi');
+    }
+}
+
+function closeGpuModal() {
+    const m = document.getElementById('addGpuModal');
+    const errEl = document.getElementById('gpuModalError');
+    if (m) m.classList.remove('open');
+    if (errEl) errEl.textContent = '';
+    editingGpuId = null;
+}
+
+function openGpuModal(idToEdit) {
+    const modal = document.getElementById('addGpuModal');
+    const titleEl = document.getElementById('gpuModalTitle');
+    const okBtn = document.getElementById('gpuModalOkBtn');
+    const nameInput = document.getElementById('gpuNameInput');
+    const cmdInput = document.getElementById('gpuCmdInput');
+    const errEl = document.getElementById('gpuModalError');
+    if (!modal) return;
+    errEl.textContent = '';
+    if (idToEdit) {
+        const rec = GPU_HOSTS.find(h => h.id === idToEdit);
+        if (!rec) return;
+        editingGpuId = idToEdit;
+        titleEl.textContent = 'GPU Makinesini Duzenle';
+        okBtn.textContent = 'Guncelle';
+        nameInput.value = rec.name || '';
+        cmdInput.value = rec.cmd || '';
+    } else {
+        editingGpuId = null;
+        titleEl.textContent = 'Yeni GPU Makinesi Ekle';
+        okBtn.textContent = 'Ekle';
+        nameInput.value = '';
+        cmdInput.value = '';
+    }
+    modal.classList.add('open');
+    nameInput.focus();
+}
+
+async function submitGpuModal() {
+    const nameInput = document.getElementById('gpuNameInput');
+    const cmdInput = document.getElementById('gpuCmdInput');
+    const errEl = document.getElementById('gpuModalError');
+    const name = nameInput.value.trim();
+    const cmd = cmdInput.value.trim();
+    if (!name) { errEl.textContent = 'Isim gerekli'; return; }
+    if (!cmd) { errEl.textContent = 'SSH komutu gerekli'; return; }
+    const isEdit = !!editingGpuId;
+    try {
+        const resp = await fetch('/api/gpu-hosts', {
+            method: isEdit ? 'PUT' : 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(isEdit ? {id: editingGpuId, name, cmd} : {name, cmd})
+        });
+        const data = await resp.json();
+        if (data.ok) {
+            GPU_HOSTS = data.gpu_hosts || [];
+            closeGpuModal();
+            await refreshGpus();
+        } else {
+            errEl.textContent = data.error || 'Islem basarisiz';
+        }
+    } catch(e) {
+        errEl.textContent = 'Sunucu hatasi';
+    }
+}
+
 function startRefreshTimer() {
     if (refreshTimer) clearInterval(refreshTimer);
     refreshTimer = setInterval(refresh, 5000);
     if (tokenRefreshTimer) clearInterval(tokenRefreshTimer);
     tokenRefreshTimer = setInterval(refreshTokens, 10000);
+    if (gpuRefreshTimer) clearInterval(gpuRefreshTimer);
+    gpuRefreshTimer = setInterval(refreshGpus, 15000);
 }
 
 function stopRefreshTimer() {
@@ -1299,6 +1695,10 @@ function stopRefreshTimer() {
     if (tokenRefreshTimer) {
         clearInterval(tokenRefreshTimer);
         tokenRefreshTimer = null;
+    }
+    if (gpuRefreshTimer) {
+        clearInterval(gpuRefreshTimer);
+        gpuRefreshTimer = null;
     }
 }
 
@@ -1383,6 +1783,7 @@ function finishDrag() {
 
 refresh();
 refreshTokens();
+refreshGpus();
 startRefreshTimer();
 </script>
 </body>
@@ -1468,7 +1869,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             content_len = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_len).decode()
             try:
-                data = json.loads(body) if body else {}
+                data = json.loads(body) if body.strip() else {}
                 name = str(data.get('name', '')).strip()
                 cmd = str(data.get('cmd', '')).strip()
                 if not cmd:
@@ -1522,7 +1923,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             content_len = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_len).decode()
             try:
-                data = json.loads(body) if body else {}
+                data = json.loads(body) if body.strip() else {}
                 h_id = str(data.get('id', '')).strip()
                 if not h_id:
                     self._json_response(400, {"ok": False, "error": "GPU makinesi kimligi gerekli"})
@@ -1590,7 +1991,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             content_len = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_len).decode()
             try:
-                data = json.loads(body) if body else {}
+                data = json.loads(body) if body.strip() else {}
                 h_id = str(data.get('id', '')).strip()
                 name = str(data.get('name', '')).strip()
                 cmd = str(data.get('cmd', '')).strip()
