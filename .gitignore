@@ -11,3 +11,6 @@ watchdog_endpoints.json
 .vscode/
 .DS_Store
 .worktrees/
+
+# SDD workspace
+.superpowers/
