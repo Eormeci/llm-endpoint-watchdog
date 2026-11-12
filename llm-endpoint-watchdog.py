@@ -7,6 +7,7 @@ and serves a real-time web dashboard.
 
 import http.server
 import json
+import re
 import socket
 import subprocess
 import threading
@@ -29,19 +30,93 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchdog_
 
 # --- Token Usage Config ---
 TOKEN_CHECK_INTERVAL = 120  # seconds between paid-agent usage refreshes
-CODEX_AUTH_FILE = os.path.expanduser("~/.codex/auth.json")
-CODEX_INSTALLATION_ID_FILE = os.path.expanduser("~/.codex/installation_id")
-CLAUDE_CRED_FILE = os.path.expanduser("~/.claude/.credentials.json")
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/codex/usage"
 CLAUDE_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+CLAUDE_REFRESH_MARGIN_MS = 5 * 60 * 1000  # refresh when <5 min left
+claude_refresh_lock = threading.Lock()
+
+def _abspath(path):
+    return os.path.abspath(os.path.expanduser(path))
+
+def discover_codex_home():
+    """Codex CLI veri klasorunu bulur: $CODEX_HOME, yoksa ~/.codex."""
+    for cand in (os.environ.get("CODEX_HOME", "").strip(), "~/.codex"):
+        if not cand:
+            continue
+        folder = _abspath(cand)
+        if os.path.isfile(os.path.join(folder, "auth.json")):
+            return folder
+    return _abspath("~/.codex")
+
+CODEX_HOME = discover_codex_home()
+CODEX_AUTH_FILE = os.path.join(CODEX_HOME, "auth.json")
+CODEX_INSTALLATION_ID_FILE = os.path.join(CODEX_HOME, "installation_id")
+
+CLAUDE_DIR_RE = re.compile(r"^\.claude(?:[-_](?P<label>.+))?$")
+CLAUDE_DEFAULT_DIR = _abspath("~/.claude")
+
+def _claude_profile_label(folder, is_default):
+    """Klasor adindan okunabilir profil etiketi uretir."""
+    if is_default:
+        return "Default"
+    base = os.path.basename(folder.rstrip(os.sep))
+    match = CLAUDE_DIR_RE.match(base)
+    raw = (match.group("label") if match else base) or ""
+    raw = re.sub(r"[-_]+", " ", raw).strip()
+    return raw.title() or "Profile"
+
+def discover_claude_profiles():
+    """Sistemdeki Claude Code profillerini otomatik bulur.
+
+    Sirasi: $CLAUDE_CONFIG_DIR (birden fazlaysa os.pathsep ile ayrilmis),
+    ~/.claude varsayilan profili ve ~/.claude-* klasorleri. Yalnizca
+    .credentials.json iceren klasorler profil sayilir; kullanici hicbir sey
+    yapilandirmadan tum hesaplarini panelde gorur.
+    """
+    candidates = []
+    env = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if env:
+        candidates += [part for part in env.split(os.pathsep) if part.strip()]
+    candidates.append(CLAUDE_DEFAULT_DIR)
+    home = os.path.expanduser("~")
+    try:
+        for name in sorted(os.listdir(home)):
+            if name != ".claude" and CLAUDE_DIR_RE.match(name):
+                candidates.append(os.path.join(home, name))
+    except OSError:
+        pass
+
+    profiles, seen = [], set()
+    for cand in candidates:
+        folder = _abspath(cand)
+        if folder in seen:
+            continue
+        cred_file = os.path.join(folder, ".credentials.json")
+        if not os.path.isfile(cred_file):
+            continue
+        seen.add(folder)
+        label = _claude_profile_label(folder, folder == CLAUDE_DEFAULT_DIR)
+        pid = "claude" if folder == CLAUDE_DEFAULT_DIR else "claude_" + re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+        base_pid, n = pid, 2
+        while any(p["id"] == pid for p in profiles):
+            pid = f"{base_pid}_{n}"
+            n += 1
+        profiles.append({"id": pid, "label": label, "dir": folder, "cred_file": cred_file})
+    return profiles
+
+CLAUDE_PROFILES = discover_claude_profiles()
+CLAUDE_CRED_FILES = {p["id"]: p["cred_file"] for p in CLAUDE_PROFILES}
 
 # --- GPU Monitor Config ---
 GPU_CHECK_INTERVAL = 60  # seconds between ssh nvidia-smi polls
 GPU_SSH_TIMEOUT = 20  # seconds per ssh command
-DEFAULT_GPU_HOSTS = [{
-    "name": "GPU-NODE",
-    "cmd": "ssh jump-host \"ssh gpu-node 'nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits'\""
-}]
+MEMORY_IDLE_PCT = 50  # a GPU counts as empty below this memory utilisation
+MEMORY_BUSY_PCT = 75  # above this memory utilisation a GPU counts as full
+# Varsayilan makine tanimlanmaz: her kullanici kendi GPU makinelerini
+# panelden ekler. Kayitlar git'e girmeyen watchdog_endpoints.json'da tutulur.
+DEFAULT_GPU_HOSTS = []
 
 # --- Favicon (SVG -> base64) ---
 FAVICON_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
@@ -98,6 +173,70 @@ def load_endpoints():
         pass
     return list(DEFAULT_ENDPOINTS)
 
+GPU_QUERY_ARGS = "--query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits"
+
+def normalize_gpu_cmd(cmd):
+    """nvidia-smi komutlarini parser'in bekledigi CSV cikti formatina cevirir.
+
+    Kullanici sadece 'ssh gpu-node nvidia-smi' gibi duz bir komut girerse
+    tablo formati doner ve parse edilemez; burada --query-gpu argumanlari
+    otomatik eklenir. --query-gpu zaten varsa komut oldugu gibi kalir.
+    """
+    cmd = (cmd or "").strip()
+    if "nvidia-smi" not in cmd or "--query-gpu" in cmd:
+        return cmd
+    return cmd.replace("nvidia-smi", "nvidia-smi " + GPU_QUERY_ARGS, 1)
+
+_HOP_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
+
+def build_gpu_cmd(host_spec):
+    """Makine adindan ssh nvidia-smi komutunu olusturur; komut gerekmez.
+
+    'gpu-node'                -> ssh gpu-node 'nvidia-smi ...'
+    'jump-host -> gpu-node'   -> ssh jump-host "ssh gpu-node 'nvidia-smi ...'"
+    Atlamalar '->' (veya '/') ile ayrilir; her hop'a 'ssh ' on eki
+    yazilabilir, ayiklanir. Shell enjeksiyonunu onlemek icin hop
+    karakterleri beyaz liste ile dogrulanir.
+    """
+    hops = []
+    for part in re.split(r"\s*(?:->|/)\s*", (host_spec or "").strip()):
+        part = part.strip()
+        if part.lower().startswith("ssh "):
+            part = part[4:].strip()
+        if not part:
+            continue
+        if not _HOP_RE.match(part):
+            raise ValueError(f"Gecersiz makine adi: {part}")
+        hops.append(part)
+    if not hops:
+        raise ValueError("Makine adi gerekli")
+    cmd = "nvidia-smi " + GPU_QUERY_ARGS
+    for i, hop in enumerate(reversed(hops)):
+        quote = "'" if i % 2 == 0 else '"'
+        cmd = f"ssh {hop} {quote}{cmd}{quote}"
+    return cmd
+
+def extract_gpu_hops(cmd):
+    """Kayitli komuttan ssh atlama zincirini cikarir: 'jump-host -> gpu-node'."""
+    hops = [m for m in re.findall(r"\bssh\s+([^\s\"']+)", cmd or "") if _HOP_RE.match(m)]
+    return " -> ".join(hops)
+
+def resolve_gpu_target(host, cmd):
+    """(host, cmd) girislerinden kesin (host, cmd) ikilisini uretir.
+
+    Makine adi verilmisse komut otomatik kurulur; komut verilmisse
+    gerekiyorsa CSV formatina duzeltilir ve makine adi komuttan cikarilir.
+    """
+    host = (host or "").strip()
+    cmd = (cmd or "").strip()
+    if host:
+        return host, build_gpu_cmd(host)
+    if cmd:
+        cmd = normalize_gpu_cmd(cmd)
+        hops = extract_gpu_hops(cmd)
+        return hops or cmd, cmd
+    raise ValueError("Makine adi gerekli")
+
 def load_gpu_hosts():
     """Load GPU host list from state file, fallback to DEFAULT_GPU_HOSTS.
     Each record is normalized to {id, name, cmd}; records with empty cmd are dropped.
@@ -114,17 +253,20 @@ def load_gpu_hosts():
                         continue
                     hid = item.get("id") or uuid.uuid4().hex[:8]
                     nm = (item.get("name") or "").strip()
-                    cmd = (item.get("cmd") or "").strip()
-                    if not cmd or hid in seen:
+                    if hid in seen:
+                        continue
+                    try:
+                        host, cmd = resolve_gpu_target(item.get("host"), item.get("cmd"))
+                    except ValueError:
                         continue
                     if not nm:
-                        nm = "GPU-" + hid[:4]
+                        nm = host.split("->")[-1].strip()
                     seen.add(hid)
-                    normalized.append({"id": hid, "name": nm, "cmd": cmd})
+                    normalized.append({"id": hid, "name": nm, "host": host, "cmd": cmd})
                 return normalized
     except Exception:
         pass
-    return [{**item, "id": uuid.uuid4().hex[:8]} for item in DEFAULT_GPU_HOSTS]
+    return [{**item, "host": extract_gpu_hops(item.get("cmd", "")), "id": uuid.uuid4().hex[:8]} for item in DEFAULT_GPU_HOSTS]
 
 def _save_state(endpoints):
     """Persist endpoints and GPU hosts to state file."""
@@ -169,18 +311,45 @@ status_lock = threading.Lock()
 start_time = datetime.now()
 
 # --- Token usage state (Claude Code + Codex CLI) ---
+def _codex_card():
+    return {"available": os.path.isfile(CODEX_AUTH_FILE), "online": False,
+            "last_check": None, "error": None, "plan": None,
+            "primary_pct": None, "primary_reset": None,
+            "secondary_pct": None, "secondary_reset": None,
+            "credits_balance": None, "credits_unlimited": None,
+            "email": None, "rate_reached": False}
+
+def _claude_card(profile):
+    return {"id": profile["id"], "label": profile["label"], "available": True,
+            "online": False, "last_check": None, "error": None, "plan": None, "tier": None,
+            "h5_pct": None, "h5_reset": None, "h5_status": None,
+            "d7_pct": None, "d7_reset": None, "d7_status": None,
+            "retry_after": None, "email": None}
+
 token_status = {
-    "codex": {"online": False, "last_check": None, "error": None, "plan": None,
-             "primary_pct": None, "primary_reset": None,
-             "secondary_pct": None, "secondary_reset": None,
-             "credits_balance": None, "credits_unlimited": None, "email": None, "rate_reached": False},
-    "claude": {"online": False, "last_check": None, "error": None, "plan": None, "tier": None,
-              "h5_pct": None, "h5_reset": None, "h5_status": None,
-              "d7_pct": None, "d7_reset": None, "d7_status": None,
-              "retry_after": None, "email": None},
+    "codex": _codex_card(),
+    "claude": {p["id"]: _claude_card(p) for p in CLAUDE_PROFILES},
     "last_check": None,
 }
 token_lock = threading.Lock()
+
+def sync_token_profiles():
+    """Sistemde yeni eklenen/silinen Codex ve Claude profillerini yansitir."""
+    global CLAUDE_PROFILES, CLAUDE_CRED_FILES
+    profiles = discover_claude_profiles()
+    with token_lock:
+        token_status["codex"]["available"] = os.path.isfile(CODEX_AUTH_FILE)
+        cards = token_status["claude"]
+        wanted = {p["id"] for p in profiles}
+        for stale in [pid for pid in cards if pid not in wanted]:
+            del cards[stale]
+        for profile in profiles:
+            card = cards.setdefault(profile["id"], _claude_card(profile))
+            card["label"] = profile["label"]
+            card["available"] = True
+    CLAUDE_PROFILES = profiles
+    CLAUDE_CRED_FILES = {p["id"]: p["cred_file"] for p in profiles}
+    return list(profiles)
 
 
 def check_endpoint(ep: str) -> EndpointStatus:
@@ -211,7 +380,7 @@ def check_endpoint(ep: str) -> EndpointStatus:
         data = json.loads(body)
         if data.get("object") != "list" or "data" not in data:
             raise ValueError("Not an OpenAI-compatible /v1/models response")
-        models = [m.get("id", "unknown") for m in data.get("data", [])]
+        models = [m.get("id", "unknown") for m in (data.get("data") or [])]
 
         status.online = True
         status.models = models
@@ -283,11 +452,20 @@ def _utc_to_local(ts):
         return None
 
 
+def _utc_to_local_date(ts):
+    """Convert a unix-seconds timestamp to a local DD.MM HH:MM string."""
+    try:
+        return datetime.fromtimestamp(int(ts)).strftime("%d.%m %H:%M")
+    except (TypeError, ValueError, OSError):
+        return None
+
+
 def fetch_codex_usage():
     """Query the ChatGPT backend for Codex CLI rate-limit / usage state."""
-    if not os.path.exists(CODEX_AUTH_FILE):
+    if not os.path.isfile(CODEX_AUTH_FILE):
         with token_lock:
-            token_status["codex"].update({"online": False, "error": "auth.json bulunamadi", "last_check": datetime.now().strftime("%H:%M:%S")})
+            token_status["codex"].update({"available": False, "online": False, "error": None,
+                                          "last_check": datetime.now().strftime("%H:%M:%S")})
         return
     try:
         auth = json.load(open(CODEX_AUTH_FILE))
@@ -316,6 +494,7 @@ def fetch_codex_usage():
         credits = data.get("credits") or {}
         with token_lock:
             token_status["codex"].update({
+                "available": True,
                 "online": True,
                 "last_check": datetime.now().strftime("%H:%M:%S"),
                 "error": None,
@@ -326,7 +505,7 @@ def fetch_codex_usage():
                 "primary_reset_at": _utc_to_local(pw.get("reset_at")),
                 "secondary_pct": sw.get("used_percent"),
                 "secondary_reset": _fmt_countdown(sw.get("reset_after_seconds")),
-                "secondary_reset_at": _utc_to_local(sw.get("reset_at")),
+                "secondary_reset_at": _utc_to_local_date(sw.get("reset_at")),
                 "credits_balance": credits.get("balance"),
                 "credits_unlimited": credits.get("unlimited"),
                 "rate_reached": bool(rl.get("limit_reached")),
@@ -336,37 +515,84 @@ def fetch_codex_usage():
             token_status["codex"].update({"online": False, "error": str(e)[:100], "last_check": datetime.now().strftime("%H:%M:%S")})
 
 
-def fetch_claude_usage():
+def refresh_claude_token(cred_file, force=False):
+    """Refresh the Claude Code OAuth access token with its refresh token and
+    write it back to credentials.json (same format Claude Code uses), so the
+    dashboard keeps working even when that profile's Claude Code isn't open.
+    Returns the (possibly re-read) creds dict."""
+    with claude_refresh_lock:
+        # Re-read: Claude Code may already have refreshed it.
+        creds = json.load(open(cred_file))
+        oauth = creds.get("claudeAiOauth") or {}
+        now_ms = int(time.time() * 1000)
+        if not force and oauth.get("expiresAt", 0) - now_ms > CLAUDE_REFRESH_MARGIN_MS:
+            return creds
+        rt = oauth.get("refreshToken")
+        if not rt:
+            raise ValueError("refreshToken yok; Claude Code ile oturumu ac")
+        payload = {"grant_type": "refresh_token", "refresh_token": rt, "client_id": CLAUDE_OAUTH_CLIENT_ID}
+        if oauth.get("scopes"):
+            payload["scope"] = " ".join(oauth["scopes"])
+        req = urllib.request.Request(
+            CLAUDE_OAUTH_TOKEN_URL, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "User-Agent": "claude-code/1.0"}, method="POST")
+        try:
+            data = json.load(urllib.request.urlopen(req, timeout=20))
+        except urllib.error.HTTPError as e:
+            raise ValueError(f"Token yenilenemedi (HTTP {e.code}); Claude Code ile oturumu ac")
+        oauth["accessToken"] = data["access_token"]
+        oauth["refreshToken"] = data.get("refresh_token", rt)
+        oauth["expiresAt"] = int(time.time() * 1000) + int(data.get("expires_in", 3600)) * 1000
+        if data.get("scope"):
+            oauth["scopes"] = data["scope"].split()
+        creds["claudeAiOauth"] = oauth
+        tmp = cred_file + ".watchdog.tmp"
+        with open(tmp, "w") as f:
+            json.dump(creds, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, cred_file)
+        return creds
+
+
+def fetch_claude_usage(pid, cred_file):
     """Probe Anthropic messages endpoint to read Claude Code rate-limit headers.
     A 429 response still carries the rate-limit headers, so this works even
     when the account is throttled (no tokens consumed on rejection)."""
-    if not os.path.exists(CLAUDE_CRED_FILE):
+    if not os.path.isfile(cred_file):
         with token_lock:
-            token_status["claude"].update({"online": False, "error": "credentials.json bulunamadi", "last_check": datetime.now().strftime("%H:%M:%S")})
+            card = token_status["claude"].get(pid)
+            if card is not None:
+                card.update({"available": False, "online": False, "error": None,
+                             "last_check": datetime.now().strftime("%H:%M:%S")})
         return
     try:
-        creds = json.load(open(CLAUDE_CRED_FILE))
-        oauth = creds.get("claudeAiOauth") or {}
-        tok = oauth.get("accessToken")
-        if not tok:
-            raise ValueError("accessToken yok")
+        creds = refresh_claude_token(cred_file)  # refreshes only if expired/near expiry
         body = json.dumps({"model": "claude-haiku-4-5", "max_tokens": 1, "messages": [{"role": "user", "content": "ok"}]}).encode()
-        headers = {
-            "Authorization": f"Bearer {tok}",
-            "anthropic-version": "2023-06-01",
-            "anthropic-beta": "oauth-2025-04-20",
-            "content-type": "application/json",
-            "User-Agent": "claude-code/1.0",
-        }
-        req = urllib.request.Request(CLAUDE_MESSAGES_URL, data=body, headers=headers, method="POST")
-        status = "ok"
-        h = None
-        try:
-            resp = urllib.request.urlopen(req, timeout=12)
-            h = resp.headers
-        except urllib.error.HTTPError as e:
-            h = e.headers
-            status = "limit" if e.code == 429 else ("err" + str(e.code))
+
+        def _probe(creds):
+            tok = (creds.get("claudeAiOauth") or {}).get("accessToken")
+            if not tok:
+                raise ValueError("accessToken yok")
+            headers = {
+                "Authorization": f"Bearer {tok}",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "oauth-2025-04-20",
+                "content-type": "application/json",
+                "User-Agent": "claude-code/1.0",
+            }
+            req = urllib.request.Request(CLAUDE_MESSAGES_URL, data=body, headers=headers, method="POST")
+            try:
+                resp = urllib.request.urlopen(req, timeout=12)
+                return "ok", resp.headers
+            except urllib.error.HTTPError as e:
+                return ("limit" if e.code == 429 else ("err" + str(e.code))), e.headers
+
+        status, h = _probe(creds)
+        if status == "err401":
+            # Token revoked/expired early: force one refresh and retry.
+            creds = refresh_claude_token(cred_file, force=True)
+            status, h = _probe(creds)
+        oauth = creds.get("claudeAiOauth") or {}
         # parse unified rate-limit headers
         def _hdr(name):
             return h.get(name) if h else None
@@ -383,11 +609,13 @@ def fetch_claude_usage():
         h5_pct = _pct(_hdr("anthropic-ratelimit-unified-5h-utilization"))
         d7_pct = _pct(_hdr("anthropic-ratelimit-unified-7d-utilization"))
         retry_after = _hdr("retry-after")
+        usable = status in ("ok", "limit")
         with token_lock:
-            token_status["claude"].update({
-                "online": True,
+            token_status["claude"].get(pid, {}).update({
+                "available": True,
+                "online": usable,
                 "last_check": datetime.now().strftime("%H:%M:%S"),
-                "error": None,
+                "error": None if usable else ("Token suresi dolmus; Claude Code ile oturumu ac" if status == "err401" else f"HTTP {status[3:]}"),
                 "email": creds.get("claudeAiOauth", {}).get("subscriptionType") and None,
                 "plan": oauth.get("subscriptionType"),
                 "tier": oauth.get("rateLimitTier"),
@@ -396,13 +624,13 @@ def fetch_claude_usage():
                 "h5_reset": _reset_local(_hdr("anthropic-ratelimit-unified-5h-reset")),
                 "d7_pct": d7_pct,
                 "d7_status": _hdr("anthropic-ratelimit-unified-7d-status"),
-                "d7_reset": _reset_local(_hdr("anthropic-ratelimit-unified-7d-reset")),
+                "d7_reset": _utc_to_local_date(_hdr("anthropic-ratelimit-unified-7d-reset")),
                 "retry_after": _fmt_countdown(retry_after) if retry_after else None,
                 "http_status": status,
             })
     except Exception as e:
         with token_lock:
-            token_status["claude"].update({"online": False, "error": str(e)[:100], "last_check": datetime.now().strftime("%H:%M:%S")})
+            token_status["claude"].get(pid, {}).update({"online": False, "error": str(e)[:100], "last_check": datetime.now().strftime("%H:%M:%S")})
 
 
 def fetch_gpu_status(item):
@@ -462,7 +690,8 @@ def fetch_gpu_status(item):
             gpus.append({
                 "index": index, "name": parts[1], "mem_used_mb": mem_used_mb,
                 "mem_total_mb": mem_total_mb, "util_pct": util_pct,
-                "idle": (util_pct == 0),
+                "idle": (mem_used_mb is not None and mem_total_mb
+                         and mem_used_mb / mem_total_mb * 100 < MEMORY_IDLE_PCT),
             })
         if invalid:
             _fail("Gecersiz nvidia-smi ciktisi")
@@ -481,10 +710,17 @@ def fetch_gpu_status(item):
 def token_loop():
     """Background thread that periodically refreshes paid-agent token usage."""
     while True:
-        tc = threading.Thread(target=fetch_codex_usage)
-        tl = threading.Thread(target=fetch_claude_usage)
-        tc.start(); tl.start()
-        tc.join(timeout=15); tl.join(timeout=15)
+        profiles = sync_token_profiles()
+        with token_lock:
+            codex_available = token_status["codex"]["available"]
+        threads = []
+        if codex_available:
+            threads.append(threading.Thread(target=fetch_codex_usage))
+        threads += [threading.Thread(target=fetch_claude_usage, args=(p["id"], p["cred_file"])) for p in profiles]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
         with token_lock:
             token_status["last_check"] = datetime.now().strftime("%H:%M:%S")
         time.sleep(TOKEN_CHECK_INTERVAL)
@@ -715,19 +951,25 @@ body {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 12px;
     margin-bottom: 16px;
 }
 .token-brand {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
+    min-width: 0;
     font-size: 1.35em;
     font-weight: 700;
 }
-.token-brand .dot { width: 12px; height: 12px; border-radius: 50%; }
+.token-brand .title { white-space: nowrap; }
+.token-brand .dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
 .token-card.codex .token-brand .dot { background: #10a37f; box-shadow: 0 0 10px #10a37f88; }
 .token-card.claude .token-brand .dot { background: #d97757; box-shadow: 0 0 10px #d9775788; }
-.token-brand .sub { color: #777; font-size: 0.7em; font-weight: 400; }
+.token-brand .sub {
+    color: #777; font-size: 0.7em; font-weight: 400;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+}
 .token-badge {
     font-size: 0.8em;
     padding: 4px 10px;
@@ -735,6 +977,7 @@ body {
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
+    flex-shrink: 0;
 }
 .token-badge.ok { background: #10a37f22; color: #10a37f; border: 1px solid #10a37f55; }
 .token-badge.limit { background: #e0313122; color: #e03131; border: 1px solid #e0313155; }
@@ -792,7 +1035,7 @@ body {
 /* GPU idle monitor */
 .gpu-section {
     max-width: 1600px;
-    margin: 0 auto 28px auto;
+    margin: 32px auto 28px auto;
 }
 .gpu-toolbar {
     display: flex;
@@ -921,14 +1164,16 @@ body {
 }
 .gpu-row {
     display: grid;
-    grid-template-columns: 52px 1fr 88px 62px;
+    grid-template-columns: 52px minmax(36px, 1fr) auto auto;
     align-items: center;
     gap: 10px;
     padding: 5px 8px;
     border-radius: 6px;
     font-size: 0.82em;
+    min-width: 0;
 }
 .gpu-row.idle { background: #10a37f14; }
+.gpu-row.mid { background: #f59f0012; }
 .gpu-row.busy { background: #e031310f; }
 .gpu-row .idx {
     color: #888;
@@ -940,11 +1185,15 @@ body {
     background: #1a1a2e;
     border-radius: 4px;
     overflow: hidden;
+    min-width: 0;
 }
 .gpu-row .mini-bar .fill {
     height: 100%;
     border-radius: 4px;
 }
+.gpu-row .fill.idle { background: linear-gradient(90deg, #76b900, #a0d911); }
+.gpu-row .fill.mid { background: linear-gradient(90deg, #f59f00, #fab005); }
+.gpu-row .fill.busy { background: linear-gradient(90deg, #e03131, #ff6b6b); }
 .gpu-row .gval {
     color: #cfcfcf;
     text-align: right;
@@ -957,6 +1206,7 @@ body {
     white-space: nowrap;
 }
 .gpu-row .tag.idle { color: #10a37f; }
+.gpu-row .tag.mid { color: #f59f00; }
 .gpu-row .tag.busy { color: #e03131; }
 .gpu-empty {
     color: #666;
@@ -1138,6 +1388,12 @@ body {
     margin-top: 10px;
     min-height: 1.2em;
 }
+.add-port-modal .modal-hint {
+    color: #888;
+    font-size: 0.85em;
+    margin-top: 8px;
+    line-height: 1.5;
+}
 /* Card action buttons (remove + edit) */
 .card-remove, .card-edit {
     position: absolute;
@@ -1218,8 +1474,9 @@ body {
 <div class="add-port-modal" id="addGpuModal">
     <div class="modal-box">
         <h3 id="gpuModalTitle">Yeni GPU Makinesi Ekle</h3>
-        <input type="text" id="gpuNameInput" placeholder="Isim (orn: GPU-NODE)" />
-        <textarea id="gpuCmdInput" rows="3" placeholder='ssh jump-host "ssh gpu-node &apos;nvidia-smi &hellip;&apos;"'></textarea>
+        <input type="text" id="gpuHostInput" placeholder="Makine (orn: gpu-node)" />
+        <input type="text" id="gpuNameInput" placeholder="Isim (opsiyonel)" />
+        <div class="modal-hint">Komut yazmaniz gerekmez; SSH nvidia-smi sorgusu otomatik kurulur.<br>Uzak makine icin: <b>jump-host -&gt; gpu-node</b></div>
         <div class="modal-btns">
             <button class="btn-ok" id="gpuModalOkBtn" onclick="submitGpuModal()">Ekle</button>
             <button class="btn-cancel" onclick="closeGpuModal()">Iptal</button>
@@ -1232,12 +1489,14 @@ body {
     <div class="subtitle">__INTERVAL__s interval · since __START__</div>
 </div>
 <div class="summary" id="summary"></div>
-<div class="gpu-section" id="gpuSection"></div>
 <div class="token-section" id="tokenSection"></div>
 <div class="grid" id="grid"></div>
+<div class="gpu-section" id="gpuSection"></div>
 <div class="footer">LLM Endpoint Watchdog v1.0 · Dashboard port __DPORT__ · Auto-refresh 5s</div>
 <script>
 const ENDPOINTS = __ENDPOINTS__;
+const MEMORY_IDLE_PCT = __MEMIDLE__;
+const MEMORY_BUSY_PCT = __MEMBUSY__;
 let refreshTimer = null;
 let tokenRefreshTimer = null;
 let gpuRefreshTimer = null;
@@ -1441,8 +1700,6 @@ async function refresh() {
 function renderTokens(t) {
     const sec = document.getElementById('tokenSection');
     if (!t) { sec.innerHTML = ''; return; }
-    const cx = t.codex || {};
-    const cl = t.claude || {};
 
     function bar(pct) {
         if (pct == null) return '<div class="usage-bar"><div class="fill" style="width:0%"></div></div>';
@@ -1451,12 +1708,13 @@ function renderTokens(t) {
     }
     function pctStr(v){ return v != null ? `%${v}` : '—'; }
 
-    let cxBadge = cx.online ? (cx.rate_reached ? 'limit' : 'ok') : 'off';
-    let cxBadgeTxt = cx.online ? (cx.rate_reached ? 'Limit Dolu' : 'Aktif') : 'Offline';
-    let cxHtml = `
+    function codexCard(cx) {
+    const cxBadge = cx.online ? (cx.rate_reached ? 'limit' : 'ok') : 'off';
+    const cxBadgeTxt = cx.online ? (cx.rate_reached ? 'Limit Dolu' : 'Aktif') : 'Offline';
+    return `
     <div class="token-card codex">
       <div class="token-head">
-        <div class="token-brand"><span class="dot"></span> Codex CLI <span class="sub">${cx.plan||''}</span></div>
+        <div class="token-brand"><span class="dot"></span><span class="title">Codex CLI</span> <span class="sub">${cx.plan||''}</span></div>
         <span class="token-badge ${cxBadge}">${cxBadgeTxt}</span>
       </div>
       <div class="usage-row">
@@ -1473,13 +1731,16 @@ function renderTokens(t) {
       </div>
       ${cx.error?`<div class="token-error">⚠ ${cx.error}</div>`:''}
     </div>`;
+    }
 
-    let clBadge = cl.online ? (cl.h5_status==='rejected' || cl.http_status==='limit' ? 'limit' : 'ok') : 'off';
-    let clBadgeTxt = cl.online ? (cl.h5_status==='rejected' || cl.http_status==='limit' ? 'Limit Dolu' : 'Aktif') : 'Offline';
-    let clHtml = `
+    function claudeCard(cl) {
+    const label = (cl.label && cl.label !== 'Default') ? ` · ${cl.label}` : '';
+    const clBadge = cl.online ? (cl.h5_status==='rejected' || cl.http_status==='limit' ? 'limit' : 'ok') : 'off';
+    const clBadgeTxt = cl.online ? (cl.h5_status==='rejected' || cl.http_status==='limit' ? 'Limit Dolu' : 'Aktif') : 'Offline';
+    return `
     <div class="token-card claude">
       <div class="token-head">
-        <div class="token-brand"><span class="dot"></span> Claude Code <span class="sub">${cl.plan||''}${cl.tier?(' · '+cl.tier):''}</span></div>
+        <div class="token-brand"><span class="dot"></span><span class="title">Claude Code${label}</span> <span class="sub">${cl.plan||''}${cl.tier?(' · '+cl.tier):''}</span></div>
         <span class="token-badge ${clBadge}">${clBadgeTxt}</span>
       </div>
       <div class="usage-row">
@@ -1497,8 +1758,17 @@ function renderTokens(t) {
       </div>
       ${cl.error?`<div class="token-error">⚠ ${cl.error}</div>`:''}
     </div>`;
+    }
 
-    sec.innerHTML = cxHtml + clHtml;
+    const cards = [];
+    if (t.codex && t.codex.available) cards.push(codexCard(t.codex));
+    const claude = t.claude || {};
+    Object.keys(claude).forEach(k => {
+        const cl = claude[k];
+        if (cl && cl.available !== false) cards.push(claudeCard(cl));
+    });
+    sec.innerHTML = cards.join('');
+    sec.style.display = cards.length ? '' : 'none';
 }
 
 async function refreshTokens() {
@@ -1540,20 +1810,18 @@ function renderGpus(g) {
             rows = `<div class="gpu-empty">Sorgulanamadi</div>`;
         } else {
             rows = `<div class="gpu-rows">` + gpus.map(gp => {
-                const isIdle = !!gp.idle;
-                const rowCls = isIdle ? 'idle' : 'busy';
-                const tagCls = isIdle ? 'idle' : 'busy';
-                const tagTxt = isIdle ? 'bosta' : 'dolu';
                 const mu = gp.mem_used_mb, mt = gp.mem_total_mb;
                 const memPct = (mt != null && mt > 0 && mu != null) ? Math.min(100, Math.round(100 * mu / mt)) : null;
-                const memFill = memPct == null ? '' : `<div class="fill ${isIdle ? 'good' : 'bad'}" style="width:${memPct}%"></div>`;
+                const tier = memPct == null ? 'mid' : (memPct > MEMORY_BUSY_PCT ? 'busy' : (memPct >= MEMORY_IDLE_PCT ? 'mid' : 'idle'));
+                const tagTxt = tier === 'busy' ? 'dolu' : (tier === 'mid' ? 'yari dolu' : 'bosta');
+                const memFill = memPct == null ? '' : `<div class="fill ${tier}" style="width:${memPct}%"></div>`;
                 const memTxt = (mu == null || mt == null) ? '—' : `${Math.round(mu/102.4)/10}/${Math.round(mt/102.4)/10} GB`;
-                const utilTxt = gp.util_pct == null ? '%—' : `%${gp.util_pct}`;
-                return `<div class="gpu-row ${rowCls}">
+                const pctTxt = memPct == null ? '%—' : `%${memPct}`;
+                return `<div class="gpu-row ${tier}">
                     <div class="idx">GPU ${gp.index == null ? '?' : gp.index}</div>
                     <div class="mini-bar">${memFill}</div>
-                    <div class="gval">${memTxt} &middot; ${utilTxt}</div>
-                    <div class="tag ${tagCls}">${tagTxt}</div>
+                    <div class="gval">${memTxt} &middot; ${pctTxt}</div>
+                    <div class="tag ${tier}">${tagTxt}</div>
                 </div>`;
             }).join('') + `</div>`;
         }
@@ -1568,6 +1836,7 @@ function renderGpus(g) {
             ${rows}
             ${s.error ? `<div class="gpu-error">⚠ ${escapeHtml(s.error)}</div>` : ''}
             <div class="gpu-meta">
+                <span><b>SSH:</b> ${escapeHtml(h.host || '—')}</span>
                 <span><b>Last:</b> ${escapeHtml(s.last_check || '—')}</span>
                 <div class="gpu-actions">
                     <button onclick="openGpuModal('${h.id}')" title="Duzenle">&#9998;</button>
@@ -1627,7 +1896,7 @@ function openGpuModal(idToEdit) {
     const titleEl = document.getElementById('gpuModalTitle');
     const okBtn = document.getElementById('gpuModalOkBtn');
     const nameInput = document.getElementById('gpuNameInput');
-    const cmdInput = document.getElementById('gpuCmdInput');
+    const hostInput = document.getElementById('gpuHostInput');
     const errEl = document.getElementById('gpuModalError');
     if (!modal) return;
     errEl.textContent = '';
@@ -1638,32 +1907,32 @@ function openGpuModal(idToEdit) {
         titleEl.textContent = 'GPU Makinesini Duzenle';
         okBtn.textContent = 'Guncelle';
         nameInput.value = rec.name || '';
-        cmdInput.value = rec.cmd || '';
+        const hops = (rec.cmd || '').match(/ssh\\s+([^\\s"']+)/g) || [];
+        hostInput.value = rec.host || hops.map(s => s.replace(/^ssh\\s+/, '')).join(' -> ');
     } else {
         editingGpuId = null;
         titleEl.textContent = 'Yeni GPU Makinesi Ekle';
         okBtn.textContent = 'Ekle';
         nameInput.value = '';
-        cmdInput.value = '';
+        hostInput.value = '';
     }
     modal.classList.add('open');
-    nameInput.focus();
+    hostInput.focus();
 }
 
 async function submitGpuModal() {
     const nameInput = document.getElementById('gpuNameInput');
-    const cmdInput = document.getElementById('gpuCmdInput');
+    const hostInput = document.getElementById('gpuHostInput');
     const errEl = document.getElementById('gpuModalError');
     const name = nameInput.value.trim();
-    const cmd = cmdInput.value.trim();
-    if (!name) { errEl.textContent = 'Isim gerekli'; return; }
-    if (!cmd) { errEl.textContent = 'SSH komutu gerekli'; return; }
+    const host = hostInput.value.trim();
+    if (!host) { errEl.textContent = 'Makine adi gerekli (orn: gpu-node)'; return; }
     const isEdit = !!editingGpuId;
     try {
         const resp = await fetch('/api/gpu-hosts', {
             method: isEdit ? 'PUT' : 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(isEdit ? {id: editingGpuId, name, cmd} : {name, cmd})
+            body: JSON.stringify(isEdit ? {id: editingGpuId, name, host} : {name, host})
         });
         const data = await resp.json();
         if (data.ok) {
@@ -1825,6 +2094,8 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             html = html.replace('__START__', start_time.strftime("%Y-%m-%d %H:%M"))
             html = html.replace('__DPORT__', str(DASHBOARD_PORT))
             html = html.replace('__ENDPOINTS__', json.dumps(ENDPOINTS))
+            html = html.replace('__MEMIDLE__', str(MEMORY_IDLE_PCT))
+            html = html.replace('__MEMBUSY__', str(MEMORY_BUSY_PCT))
             html = html.replace('__FAVICON__', FAVICON_B64)
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
@@ -1871,23 +2142,22 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             try:
                 data = json.loads(body) if body.strip() else {}
                 name = str(data.get('name', '')).strip()
-                cmd = str(data.get('cmd', '')).strip()
-                if not cmd:
-                    self._json_response(400, {"ok": False, "error": "SSH komutu gerekli"})
+                try:
+                    host, cmd = resolve_gpu_target(data.get('host'), data.get('cmd'))
+                except ValueError as e:
+                    self._json_response(400, {"ok": False, "error": str(e)})
                     return
                 if not name:
-                    self._json_response(400, {"ok": False, "error": "Isim gerekli"})
-                    return
+                    name = host.split("->")[-1].strip()
                 if any(h["cmd"] == cmd for h in GPU_HOSTS):
-                    shown = cmd[:40] + "..." if len(cmd) > 40 else cmd
-                    self._json_response(409, {"ok": False, "error": f"{shown} zaten izleniyor"})
+                    self._json_response(409, {"ok": False, "error": f"{host} zaten izleniyor"})
                     return
                 new_id = uuid.uuid4().hex[:8]
-                item = {"id": new_id, "name": name, "cmd": cmd}
+                item = {"id": new_id, "name": name, "host": host, "cmd": cmd}
                 GPU_HOSTS.append(item)
                 with gpu_lock:
                     gpu_status[new_id] = {
-                        "id": new_id, "name": name, "cmd": cmd,
+                        "id": new_id, "name": name, "host": host, "cmd": cmd,
                         "online": False, "error": None, "last_check": None,
                         "gpus": [], "idle_count": 0, "total": 0,
                     }
@@ -1994,29 +2264,28 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 data = json.loads(body) if body.strip() else {}
                 h_id = str(data.get('id', '')).strip()
                 name = str(data.get('name', '')).strip()
-                cmd = str(data.get('cmd', '')).strip()
                 if not h_id:
                     self._json_response(400, {"ok": False, "error": "GPU makinesi kimligi gerekli"})
                     return
-                if not cmd:
-                    self._json_response(400, {"ok": False, "error": "SSH komutu gerekli"})
+                try:
+                    host, cmd = resolve_gpu_target(data.get('host'), data.get('cmd'))
+                except ValueError as e:
+                    self._json_response(400, {"ok": False, "error": str(e)})
                     return
                 if not name:
-                    self._json_response(400, {"ok": False, "error": "Isim gerekli"})
-                    return
+                    name = host.split("->")[-1].strip()
                 idx = next((i for i, h in enumerate(GPU_HOSTS) if h["id"] == h_id), -1)
                 if idx == -1:
                     self._json_response(404, {"ok": False, "error": f"{h_id} bulunamadi"})
                     return
                 if any(h["cmd"] == cmd and h["id"] != h_id for h in GPU_HOSTS):
-                    shown = cmd[:40] + "..." if len(cmd) > 40 else cmd
-                    self._json_response(409, {"ok": False, "error": f"{shown} zaten izleniyor"})
+                    self._json_response(409, {"ok": False, "error": f"{host} zaten izleniyor"})
                     return
-                item = {"id": h_id, "name": name, "cmd": cmd}
+                item = {"id": h_id, "name": name, "host": host, "cmd": cmd}
                 GPU_HOSTS[idx] = item
                 with gpu_lock:
                     gpu_status[h_id] = {
-                        "id": h_id, "name": name, "cmd": cmd,
+                        "id": h_id, "name": name, "host": host, "cmd": cmd,
                         "online": False, "error": None, "last_check": None,
                         "gpus": [], "idle_count": 0, "total": 0,
                     }
